@@ -99,7 +99,7 @@ public actor AppleTranslationEngine: TranslationEngine {
 
     // MARK: - sessions
 
-    nonisolated static var strategyAPIAvailable: Bool {
+    public nonisolated static var strategyAPIAvailable: Bool {
         if #available(macOS 26.4, *) { return true }
         return false
     }
@@ -163,5 +163,17 @@ public enum AppleAvailability {
             entries.append(LanguageEntry(code: code, name: LanguageNames.name(for: code), targets: targets.sorted()))
         }
         return entries
+    }
+}
+
+extension AppleAvailability {
+    /// Status of the en -> ko pair for `doctor` (only call inside a GUI login session).
+    public static func englishToKoreanStatus() async -> String {
+        switch await LanguageAvailability().status(from: Locale.Language(identifier: "en"), to: Locale.Language(identifier: "ko")) {
+        case .installed: return "installed"
+        case .supported: return "supported"
+        case .unsupported: return "unsupported"
+        @unknown default: return "unknown"
+        }
     }
 }
