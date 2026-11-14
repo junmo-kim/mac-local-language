@@ -50,3 +50,26 @@ enum Launcher {
         SessionKind.parse(managerName: managerName())
     }
 }
+
+extension Launcher {
+    static func launchctl(_ arguments: [String], timeout: TimeInterval = 10) -> Output? {
+        run("/bin/launchctl", arguments, timeout: timeout)
+    }
+
+    /// `open -g -j -a <bundle>`: background, hidden, and deliberately no `--args` (apps started
+    /// by LaunchServices get neither arguments nor the caller's environment). `newInstance` adds
+    /// `-n` so a still-alive earlier instance cannot swallow the launch (used for the install
+    /// bootstrap request only).
+    static func openApp(_ bundle: URL, newInstance: Bool = false, timeout: TimeInterval = 10) -> Bool {
+        let flags = newInstance ? ["-n", "-g", "-j", "-a"] : ["-g", "-j", "-a"]
+        return run("/usr/bin/open", flags + [bundle.path], timeout: timeout)?.status == 0
+    }
+
+    static func codesign(label: String, bundle: URL, timeout: TimeInterval = 30) -> Output? {
+        run("/usr/bin/codesign", ["--force", "--sign", "-", "--identifier", label, bundle.path], timeout: timeout)
+    }
+
+    static func plutilLint(_ file: URL) -> Output? {
+        run("/usr/bin/plutil", ["-lint", file.path], timeout: 10)
+    }
+}

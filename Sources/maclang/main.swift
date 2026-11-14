@@ -13,6 +13,7 @@ func printUsage() {
       detect [TEXT] [--format text|json|yaml]
       languages [--from LANG] [--strategy S] [--format yaml|json] [--timeout SEC] [--route auto|local|server]
       doctor [--format yaml|json]
+      service install [--host H] [--port N] | uninstall | start | stop | status [--format yaml|json]
       serve [--host H] [--port N] [--max-body-kib K] [--engine-timeout SEC]
       --version | --help
 
@@ -37,23 +38,25 @@ func dispatch(_ args: [String]) async -> Int32 {
         case "languages": return try await LanguagesCommand.run(rest)
         case "doctor":    return try await DoctorCommand.run(rest)
         case "serve":     return try await ServeCommand.run(rest)
+        case "service":   return try await ServiceCommand.run(rest)
         case "help", "-h", "--help": printUsage(); return ExitCode.success.rawValue
         case "version", "--version": IO.emitText("maclang \(Version.current)\n"); return ExitCode.success.rawValue
         default:
-            IO.warn("error: unknown command '\(sub)' (try: maclang --help) (\(ErrorCode.invalidRequest.rawValue))")
+            IO.warn(CLIError("unknown command '\(sub)'", fix: "run `maclang --help`; commands: translate, detect, languages, doctor, serve, service",
+                             field: "command", received: sub).report)
             return ExitCode.usage.rawValue
         }
     } catch let error as CLIError {
-        IO.warn("error: \(error.message) (\(error.code.rawValue))")
+        IO.warn(error.report)
         return error.exitCode
     } catch {
-        IO.warn("error: unexpected failure (\(ErrorCode.internalError.rawValue))")
+        IO.warn(CLIError("unexpected failure", code: .internalError).report)
         return ExitCode.runtimeError.rawValue
     }
 }
 
 guard let code = await IO.withProcessDataOutputBoundary({
-    await dispatch(arguments)
+    AppMode.shouldEnter() ? await AppMode.run() : await dispatch(arguments)
 }) else {
     IO.warn("error: could not reserve stdout for structured output")
     exit(ExitCode.runtimeError.rawValue)

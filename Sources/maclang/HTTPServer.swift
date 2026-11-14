@@ -6,105 +6,7 @@ import os
 import LangCore
 import LangEngine
 
-struct HealthInfo: Sendable {
-    let status: String
-    let version: String
-    let pid: Int?
-    let session: String?
-    let engine: String?
-    let label: String?
-    let executable: String?
-}
-
-enum HTTPServer {
-    /// Minimal blocking `GET /health` over a BSD socket with a hard deadline.
-    /// Returns nil when nothing answers 200 with a JSON object in time.
-    static func probeHealth(host: String, port: Int, timeout: TimeInterval) -> HealthInfo? {
-        var hints = addrinfo()
-        hints.ai_family = AF_UNSPEC
-        hints.ai_socktype = SOCK_STREAM
-        var res: UnsafeMutablePointer<addrinfo>?
-        guard getaddrinfo(host, String(port), &hints, &res) == 0, let first = res else { return nil }
-        defer { freeaddrinfo(res) }
-
-        let deadline = Date().addingTimeInterval(timeout)
-        var cursor: UnsafeMutablePointer<addrinfo>? = first
-        while let ai = cursor {
-            cursor = ai.pointee.ai_next
-            let fd = socket(ai.pointee.ai_family, ai.pointee.ai_socktype, ai.pointee.ai_protocol)
-            if fd < 0 { continue }
-            defer { close(fd) }
-            var noSigPipe: Int32 = 1
-            setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &noSigPipe, socklen_t(MemoryLayout<Int32>.size))
-            guard connectWithDeadline(fd, ai.pointee.ai_addr, ai.pointee.ai_addrlen, deadline) else { continue }
-
-            let request = "GET /health HTTP/1.1\r\nHost: \(host)\r\nConnection: close\r\n\r\n"
-            guard sendAll(fd, Array(request.utf8), deadline) else { continue }
-            var data = Data()
-            var buf = [UInt8](repeating: 0, count: 4096)
-            while data.count < 65_536 {
-                guard waitFor(fd, POLLIN, deadline) else { break }
-                let n = read(fd, &buf, buf.count)
-                if n <= 0 { break }
-                data.append(contentsOf: buf[0..<n])
-            }
-            if let info = parseHealth(data) { return info }
-        }
-        return nil
-    }
-
-    static func parseHealth(_ raw: Data) -> HealthInfo? {
-        let sep = Data("\r\n\r\n".utf8)
-        guard let range = raw.range(of: sep),
-              let head = String(data: raw[raw.startIndex..<range.lowerBound], encoding: .utf8),
-              let statusLine = head.components(separatedBy: "\r\n").first,
-              statusLine.split(separator: " ").dropFirst().first == "200",
-              let obj = try? JSONSerialization.jsonObject(with: Data(raw[range.upperBound...])) as? [String: Any],
-              let status = obj["status"] as? String, let version = obj["version"] as? String
-        else { return nil }
-        return HealthInfo(status: status, version: version, pid: obj["pid"] as? Int,
-                          session: obj["session"] as? String, engine: obj["engine"] as? String,
-                          label: obj["label"] as? String, executable: obj["executable"] as? String)
-    }
-
-    // MARK: - socket helpers
-
-    private static func remaining(_ deadline: Date) -> Int32 {
-        Int32(max(0, min(Double(Int32.max), deadline.timeIntervalSinceNow * 1000)))
-    }
-
-    private static func waitFor(_ fd: Int32, _ events: Int32, _ deadline: Date) -> Bool {
-        var p = pollfd(fd: fd, events: Int16(events), revents: 0)
-        let r = poll(&p, 1, remaining(deadline))
-        return r > 0 && (p.revents & Int16(events | POLLHUP)) != 0
-    }
-
-    private static func connectWithDeadline(_ fd: Int32, _ addr: UnsafePointer<sockaddr>!, _ len: socklen_t, _ deadline: Date) -> Bool {
-        let flags = fcntl(fd, F_GETFL)
-        _ = fcntl(fd, F_SETFL, flags | O_NONBLOCK)
-        let r = connect(fd, addr, len)
-        if r != 0 {
-            guard errno == EINPROGRESS, waitFor(fd, POLLOUT, deadline) else { return false }
-            var err: Int32 = 0
-            var errLen = socklen_t(MemoryLayout<Int32>.size)
-            getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &errLen)
-            guard err == 0 else { return false }
-        }
-        return true
-    }
-
-    private static func sendAll(_ fd: Int32, _ bytes: [UInt8], _ deadline: Date) -> Bool {
-        var sent = 0
-        while sent < bytes.count {
-            guard waitFor(fd, POLLOUT, deadline) else { return false }
-            let n = bytes[sent...].withUnsafeBytes { write(fd, $0.baseAddress, $0.count) }
-            if n <= 0 { return false }
-            sent += n
-        }
-        return true
-    }
-}
-
+enum HTTPServer {}
 
 // MARK: - serving
 
@@ -146,9 +48,13 @@ struct ServerSettings: Sendable {
     let engineName: String
     let session: String
     let label: String
+    /// Started by launchd for this label (`XPC_SERVICE_NAME == label`): KeepAlive keeps retrying.
+    let supervised: Bool
 }
 
-/// Everything a request handler needs. Engine access goes through `gate` and `withTimeout`.
+/// Everything a request handler needs. Translation goes through `gate` and `withTimeout`.
+/// The language catalog does not: it only queries `LanguageAvailability` (no sessions), and
+/// its ~16 s start-up warm-up must not hold the first translation behind it.
 final class ServerContext: Sendable {
     let engine: any TranslationEngine
     let gate = SerialGate()
@@ -159,9 +65,8 @@ final class ServerContext: Sendable {
     init(engine: any TranslationEngine, settings: ServerSettings) {
         self.engine = engine
         self.settings = settings
-        let gate = self.gate
-        self.catalog = LanguageCatalog { strategy, from in
-            try await gate.run { try await engine.languages(strategy: strategy, from: from) }
+        self.catalog = LanguageCatalog(validate: { (s: StrategyOption?) throws(EngineError) in try engine.validateStrategy(s) }) { strategy, from in
+            try await engine.languages(strategy: strategy, from: from)
         }
         let executable = Bundle.main.executableURL?.resolvingSymlinksInPath().path
             ?? CommandLine.arguments.first ?? "maclang"
@@ -198,7 +103,13 @@ extension HTTPServer {
 
         func alreadyRunningOrFail(_ reason: String) -> Int32 {
             let clientHost = Config(host: settings.host, port: settings.port).clientHost
-            if let info = probeHealth(host: clientHost, port: settings.port, timeout: 1), info.status == "ok" {
+            if let info = ServerClient(host: clientHost, port: settings.port).health(timeout: 1) {
+                if settings.supervised {
+                    // Exit non-zero so KeepAlive(SuccessfulExit=false) retries until the unsupervised
+                    // instance is gone and launchd owns the server.
+                    log("another maclang (version \(info.version)) holds \(settings.host):\(settings.port); exiting so launchd retries")
+                    return ExitCode.runtimeError.rawValue
+                }
                 log("already running on \(settings.host):\(settings.port) (version \(info.version))")
                 return ExitCode.success.rawValue
             }
@@ -243,7 +154,7 @@ extension HTTPServer {
             switch event {
             case .ready:
                 isReady = true
-                log("listening on \(settings.host):\(settings.port) (engine \(settings.engineName), session \(settings.session))")
+                log("listening on \(settings.host):\(settings.port) (engine \(settings.engineName), session \(settings.session)\(settings.supervised ? ", launchd-managed" : ""))")
                 Task { await context.catalog.warmUp() }
             case .failed(let reason):
                 listener.cancel()
@@ -283,9 +194,22 @@ extension HTTPServer {
         return listener
     }
 
+    private static func receiveChunk(_ conn: NWConnection) async -> Data? {
+        await withCheckedContinuation { (c: CheckedContinuation<Data?, Never>) in
+            conn.receive(minimumIncompleteLength: 1, maximumLength: 65_536) { data, _, _, _ in
+                if let data, !data.isEmpty { c.resume(returning: data) } else { c.resume(returning: nil) }
+            }
+        }
+    }
+
+    private static let noLengthError = LangError(
+        .invalidRequest, "chunked bodies are not supported; send Content-Length",
+        fix: "send the body with a Content-Length header (e.g. curl --data-binary) instead of Transfer-Encoding: chunked",
+        field: "Content-Length")
+
     private enum Received {
         case request(HTTPRequest)
-        case reject(ErrorCode, String)
+        case reject(LangError)
         case none
     }
 
@@ -301,8 +225,8 @@ extension HTTPServer {
         switch await receiveHTTPRequest(conn, maxBody: context.settings.maxBodyBytes) {
         case .none:
             return
-        case .reject(let code, let message):
-            result = errorResult(code, message)
+        case .reject(let error):
+            result = errorResult(error)
         case .request(let req):
             watchdog.cancel()
             let path = req.path.split(separator: "?", maxSplits: 1, omittingEmptySubsequences: false).first.map(String.init) ?? req.path
@@ -311,14 +235,27 @@ extension HTTPServer {
         }
         log("\(logLine) -> \(result.status)" + (result.code.map { " \($0.rawValue)" } ?? ""))
         await sendHTTPResponse(conn, status: result.status, body: Data(result.body.utf8))
+        if result.code == .payloadTooLarge {
+            // The client is probably still sending the oversized body. Closing now would reset the
+            // connection and could discard the 413 it has not read yet, so read and discard until it
+            // finishes or 2 s pass.
+            let cutoff = DispatchWorkItem { conn.cancel() }
+            DispatchQueue.global().asyncAfter(deadline: .now() + 2, execute: cutoff)
+            while await receiveChunk(conn) != nil {}
+            cutoff.cancel()
+        }
     }
 
     // MARK: routing
 
-    private static func errorResult(_ code: ErrorCode, _ message: String) -> HTTPResult {
-        HTTPResult(status: code.httpStatus ?? 500,
-                   body: Wire.jsonBody(Wire.errorBody(message: message, code: code)), code: code)
+    private static func errorResult(_ e: LangError) -> HTTPResult {
+        HTTPResult(status: e.code.httpStatus ?? 500, body: Wire.jsonBody(Wire.errorBody(e)), code: e.code)
     }
+
+    /// Method each known path accepts (for the 405 fix).
+    private static let allowedMethod: [String: String] = [
+        "/health": "GET", "/translate": "POST", "/detect": "POST", "/languages": "GET",
+    ]
 
     private static func route(_ req: HTTPRequest, path: String, context: ServerContext) async -> HTTPResult {
         let contentType = req.headers["content-type"]
@@ -332,19 +269,22 @@ extension HTTPServer {
             case ("/detect", "POST"):
                 let text = try Wire.decodeDetect(body: req.body, contentType: contentType)
                 let found = NLDetector.detect(text, max: 3)
-                guard !found.isEmpty else { throw LangError(.unableToDetect, "could not detect the language") }
+                guard !found.isEmpty else { throw LangError(.unableToDetect, "could not detect the language", field: "q") }
                 return HTTPResult(status: 200, body: Wire.jsonBody(Wire.detect(found)))
             case ("/languages", "GET"):
                 return try await languages(query: req.path, context: context)
             case ("/health", _), ("/translate", _), ("/detect", _), ("/languages", _):
-                return errorResult(.methodNotAllowed, "method \(req.method) not allowed for \(path)")
+                let allowed = allowedMethod[path] ?? "GET"
+                return errorResult(LangError(.methodNotAllowed, "method \(req.method) not allowed for \(path)",
+                                             fix: "use \(allowed) \(path)", field: "method", received: req.method))
             default:
-                return errorResult(.notFound, "unknown path \(path)")
+                return errorResult(LangError(.notFound, "unknown path \(path)",
+                                             fix: "use GET /health, POST /translate, POST /detect or GET /languages", field: "path", received: path))
             }
         } catch let e as LangError {
-            return errorResult(e.code, e.message)
+            return errorResult(e)
         } catch {
-            return errorResult(.internalError, "internal error")
+            return errorResult(LangError(.internalError, "internal error"))
         }
     }
 
@@ -371,7 +311,7 @@ extension HTTPServer {
             let params = Wire.parseForm(String(path[path.index(after: q)...]))
             if let raw = params["strategy"] as? String {
                 guard let s = StrategyOption(rawValue: raw) else {
-                    throw LangError(.invalidRequest, "strategy must be high-fidelity or low-latency")
+                    throw LangError(.invalidRequest, "strategy must be high-fidelity or low-latency", fix: "use ?strategy=high-fidelity or ?strategy=low-latency, or omit it", field: "strategy", received: raw)
                 }
                 requested = s
             }
@@ -396,43 +336,50 @@ extension HTTPServer {
         var expected = 0
 
         while true {
-            let chunk = await withCheckedContinuation { (c: CheckedContinuation<Data?, Never>) in
-                conn.receive(minimumIncompleteLength: 1, maximumLength: 65_536) { data, _, _, error in
-                    if let data, !data.isEmpty { c.resume(returning: data) } else { c.resume(returning: nil) }
-                }
-            }
-            guard let chunk else { return .none }
+            guard let chunk = await receiveChunk(conn) else { return .none }
             buf.append(chunk)
 
             if bodyStart == nil {
                 if let range = buf.range(of: sep) {
                     bodyStart = buf.distance(from: buf.startIndex, to: range.upperBound)
                     guard let head = String(data: buf[buf.startIndex..<range.lowerBound], encoding: .utf8) else {
-                        return .reject(.invalidRequest, "headers are not valid UTF-8")
+                        return .reject(LangError(.invalidRequest, "headers are not valid UTF-8", fix: "send ASCII/UTF-8 request headers"))
                     }
-                    for line in head.components(separatedBy: "\r\n").dropFirst() {
+                    let headLines = head.components(separatedBy: "\r\n")
+                    let method = headLines.first?.split(separator: " ").first.map(String.init) ?? ""
+                    var sawLength = false
+                    for line in headLines.dropFirst() {
                         let lower = line.lowercased()
+                        if lower.hasPrefix("transfer-encoding:"), lower.contains("chunked") {
+                            return .reject(Self.noLengthError)
+                        }
                         if lower.hasPrefix("content-length:") {
+                            sawLength = true
                             let value = line.dropFirst("content-length:".count).trimmingCharacters(in: .whitespaces)
                             guard let cl = Int(value), cl >= 0 else {
-                                return .reject(.invalidRequest, "invalid Content-Length")
+                                return .reject(LangError(.invalidRequest, "invalid Content-Length", fix: "send Content-Length as the body size in bytes", field: "Content-Length", received: value))
                             }
                             expected = cl
-                            break
                         }
                     }
+                    // No Content-Length is an empty body, unless bytes follow the headers anyway.
+                    if !sawLength, ["POST", "PUT", "PATCH"].contains(method), buf.count > (bodyStart ?? 0) {
+                        return .reject(Self.noLengthError)
+                    }
                     if expected > maxBody {
-                        return .reject(.payloadTooLarge, "request body exceeds \(maxBody / 1024) KiB")
+                        return .reject(LangError(.payloadTooLarge, "request body exceeds \(maxBody / 1024) KiB",
+                                                 fix: "split the text into requests under \(maxBody / 1024) KiB, or start the server with a larger `serve --max-body-kib`",
+                                                 field: "Content-Length", received: "\(expected)"))
                     }
                 } else if buf.count > headerCap {
-                    return .reject(.invalidRequest, "request headers too large")
+                    return .reject(LangError(.invalidRequest, "request headers too large", fix: "send fewer or shorter request headers (limit 64 KiB)"))
                 }
             }
             if let start = bodyStart, buf.count - start >= expected { break }
         }
 
         do { return .request(try HTTPParser.parse(buf)) }
-        catch { return .reject(.invalidRequest, "malformed HTTP request") }
+        catch { return .reject(LangError(.invalidRequest, "malformed HTTP request", fix: "send a well-formed HTTP/1.1 request, e.g. `curl -s -d 'q=Hello&source=auto&target=ko' http://127.0.0.1:9091/translate`")) }
     }
 
     private static func sendHTTPResponse(_ conn: NWConnection, status: Int, body: Data) async {
