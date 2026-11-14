@@ -41,33 +41,38 @@ cleanup() {
 trap cleanup EXIT
 
 # --- preconditions ---------------------------------------------------------------------------
-[[ "$(launchctl print "gui/$uid" 2>/dev/null | grep -c 'kim.junmo.maclang')" == 0 ]] || fail "a kim.junmo.maclang service is already loaded"
+[[ "$(launchctl print "gui/$uid" 2>/dev/null | grep -c "$label")" == 0 ]] || fail "the e2e service $label is already loaded"
 lsof -nP -iTCP:$port -sTCP:LISTEN >/dev/null 2>&1 && fail "port $port is busy"
+# A previous test's connections can leave the port in TIME_WAIT (~30s); the server binds without
+# SO_REUSEADDR, so wait until a plain bind works.
+python3 -I - "$port" <<'PY' || fail "port $port cannot be bound"
+import socket, sys, time
+for _ in range(60):
+    s = socket.socket()
+    try:
+        s.bind(("127.0.0.1", int(sys.argv[1]))); s.close(); sys.exit(0)
+    except OSError:
+        s.close(); time.sleep(1)
+sys.exit(1)
+PY
 printf '{"host":"127.0.0.1","port":%d}' "$port" >"$MACLANG_HOME/config.json"
 echo "session of this shell: $(launchctl managername)"
 
 # --- Phase 5: auto-started server ------------------------------------------------------------
 # R-1: first call builds+signs the bundle, opens it in the GUI session and forwards the request.
-# Observed on the dev Mac: the system's default strategy (low-latency) had no language packs while
-# high-fidelity did, so an un-strategied call answers 69 not_installed. That is recorded, and the
-# remaining assertions use --strategy high-fidelity so they still exercise the whole path.
+# No --strategy: the engine must resolve the system's preferred strategy itself (E-STR).
 strat=()
 start=$(now_ms)
 set +e; out=$("$bin" translate "The quick brown fox jumps over the lazy dog." --to ko 2>"$MACLANG_HOME/err"); rc=$?; set -e
-if [[ $rc == 69 ]] && grep -q not_installed "$MACLANG_HOME/err"; then
-  note "R-1 default strategy answered 69 not_installed ($(tr '\n' ' ' <"$MACLANG_HOME/err"))"
-  [[ -n "${E2E_STRICT_DEFAULT:-}" ]] && fail "R-1 default strategy not installed"
-  strat=(--strategy high-fidelity)
-  out=$("$bin" translate "The quick brown fox jumps over the lazy dog." --to ko ${strat[@]+"${strat[@]}"})
-elif [[ $rc != 0 ]]; then
-  fail "R-1 exit $rc: $(cat "$MACLANG_HOME/err")"
-fi
+[[ $rc == 0 ]] || fail "R-1 exit $rc: $(cat "$MACLANG_HOME/err")"
 r1_ms=$(( $(now_ms) - start ))
 echo "$out" | has_hangul || fail "R-1 no Hangul in output: $out"
 codesign --verify --strict "$MACLANG_HOME/MacLang.app" || fail "R-1 bundle signature"
 pid1=$(health_field pid)
 expect_eq "R-1 session" "$(health_field session)" Aqua
 expect_eq "R-1 label" "$(health_field label)" "$label"
+# The catalog warm-up (~16 s) must not delay the first translation (it once took 18.5 s).
+(( r1_ms < 10000 )) || fail "R-1 took ${r1_ms}ms (>= 10000ms): first translation waited on something"
 echo "R-1 ok: ${r1_ms}ms -> $out"
 
 # R-2: second call reuses the same server and is faster.
@@ -114,13 +119,122 @@ else
   fail "R-6 unexpected exit $rc: $(cat "$MACLANG_HOME/err")"
 fi
 
+# install-over-running: `service install` with an auto-started (non-agent) server running and a changed executable.
+# The server must be stopped BEFORE the bundle is rebuilt, and /health must then show the new bundle.
+cp -p "$bin" "$MACLANG_HOME/maclang-copy"
+touch "$MACLANG_HOME/maclang-copy"
+copy_mtime=$(stat -f %m "$MACLANG_HOME/maclang-copy")
+health >/dev/null 2>&1 || fail "install-over-running precondition: auto-started server not running"
+"$MACLANG_HOME/maclang-copy" service install --port $port >/dev/null 2>"$MACLANG_HOME/install.err" \
+  || fail "install-over-running install over a running auto-started server failed: $(cat "$MACLANG_HOME/install.err")"
+wait_health 50 || fail "install-over-running health after install"
+real() { python3 -I -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$1"; }
+expect_eq "install-over-running executable" "$(real "$(health_field executable)")" "$(real "$MACLANG_HOME/MacLang.app/Contents/MacOS/maclang")"
+python3 -I -c 'import json,sys; d=json.load(open(sys.argv[1])); sys.exit(0 if d["mtime"]==int(sys.argv[2]) else 1)' "$MACLANG_HOME/bundle-stamp" "$copy_mtime" \
+  || fail "install-over-running bundle was not rebuilt from the changed executable"
+grep -q 'launchd-managed' "$MACLANG_HOME/logs/server.log" || fail "install-over-running agent-run server does not see XPC_SERVICE_NAME == label"
+"$bin" service uninstall >/dev/null || fail "install-over-running uninstall"
+wait_port_free || fail "install-over-running port after uninstall"
+echo "install-over-running ok"
+
 # R-11: detect needs no server (and no autostart)
 "$bin" service stop >/dev/null || fail "stop before R-11"
 wait_port_free || fail "R-11 server still up"
 expect_eq "R-11 detect" "$(MACLANG_AUTOSTART=0 "$bin" detect "안녕하세요")" ko
 echo "R-11 ok"
 
-# PHASE6_MARKER
+# --- Phase 6: LaunchAgent service ------------------------------------------------------------
+# R-7: install from a non-GUI shell goes through the bootstrap-request handshake with the app.
+"$bin" service install --port $port >"$MACLANG_HOME/install.out" 2>"$MACLANG_HOME/install.err" \
+  || fail "R-7 install failed: $(cat "$MACLANG_HOME/install.err")"
+print_out=$(launchctl print "gui/$uid/$label")
+grep -q 'state = running' <<<"$print_out" || fail "R-7 agent not running"
+wait_health 50 || fail "R-7 health"
+expect_eq "R-7 session" "$(health_field session)" Aqua
+"$bin" service status --format json | python3 -I -c 'import json,sys; d=json.load(sys.stdin); sys.exit(0 if d["loaded"] is True and d["installed"] is True and d["server"]["reachable"] is True else 1)' \
+  || fail "R-7 status"
+[[ -f "$MACLANG_LAUNCH_AGENTS_DIR/$label.plist" ]] || fail "R-7 plist missing"
+[[ ! -e "$MACLANG_HOME/bootstrap-request" && ! -e "$MACLANG_HOME/bootstrap-result" ]] || fail "R-7 handshake files left behind"
+echo "R-7 ok (pid $(health_field pid))"
+
+# install-validation: an install that fails validation (new port held by another program) changes nothing.
+pid_before=$(health_field pid)
+python3 -I -m http.server 19092 --bind 127.0.0.1 >/dev/null 2>&1 &
+py2=$!; helper_pids+=("$py2")
+for _ in $(seq 1 50); do lsof -nP -iTCP:19092 -sTCP:LISTEN >/dev/null 2>&1 && break; sleep 0.1; done
+set +e; "$bin" service install --port 19092 >/dev/null 2>"$MACLANG_HOME/err"; rc=$?; set -e
+expect_eq "install-validation exit" "$rc" 75
+grep -q 'in use by another program' "$MACLANG_HOME/err" || fail "install-validation message: $(cat "$MACLANG_HOME/err")"
+loaded || fail "install-validation the original agent is no longer loaded"
+expect_eq "install-validation same pid on 19091" "$(health_field pid)" "$pid_before"
+grep -q '"port":19091' "$MACLANG_HOME/config.json" || grep -q '"port" *: *19091' "$MACLANG_HOME/config.json" || fail "install-validation config changed: $(cat "$MACLANG_HOME/config.json")"
+kill "$py2" 2>/dev/null || true; wait "$py2" 2>/dev/null || true
+echo "install-validation ok (agent untouched, pid $pid_before)"
+
+# R-8: stop is a clean exit, so KeepAlive(SuccessfulExit=false) must not restart it; start kickstarts.
+"$bin" service stop >/dev/null || fail "R-8 stop"
+wait_port_free || fail "R-8 port still bound"
+sleep 12
+launchctl print "gui/$uid/$label" >"$MACLANG_HOME/print.out" 2>&1
+grep -q 'state = not running' "$MACLANG_HOME/print.out" || fail "R-8 restarted after stop: $(grep 'state =' "$MACLANG_HOME/print.out" | head -1)"
+grep -q 'last exit code = 0' "$MACLANG_HOME/print.out" || fail "R-8 last exit code: $(grep 'last exit code' "$MACLANG_HOME/print.out")"
+health >/dev/null 2>&1 && fail "R-8 server came back"
+# autostart-under-launchd: with the agent loaded, a CLI call that finds no server restarts it UNDER launchd.
+out=$("$bin" translate "hello" --from en --to ko) || fail "autostart-under-launchd translate after stop"
+launchctl print "gui/$uid/$label" >"$MACLANG_HOME/print.out" 2>&1
+grep -q 'state = running' "$MACLANG_HOME/print.out" || fail "autostart-under-launchd agent not running after CLI auto-start"
+launchd_pid=$(grep -E '^\s+pid = ' "$MACLANG_HOME/print.out" | head -1 | sed 's/.*= //')
+expect_eq "autostart-under-launchd health pid == launchd pid" "$(health_field pid)" "$launchd_pid"
+echo "autostart-under-launchd ok (pid $launchd_pid under launchd)"
+"$bin" service start >/dev/null || fail "R-8 start"
+wait_health 150 || fail "R-8 health after start"
+echo "R-8 ok"
+
+# R-9: a crash is restarted by launchd (ThrottleInterval 10s)
+old=$(health_field pid)
+kill -9 "$old"
+new=""
+for _ in $(seq 1 200); do
+  new=$(health_field pid 2>/dev/null || true)
+  [[ -n "$new" && "$new" != "$old" ]] && break
+  sleep 0.1
+done
+[[ -n "$new" && "$new" != "$old" ]] || fail "R-9 no restart within 20s"
+echo "R-9 ok ($old -> $new)"
+
+# R-10: uninstall unloads, moves the plist to the Trash and frees the port
+"$bin" service uninstall >/dev/null || fail "R-10 uninstall"
+if launchctl print "gui/$uid/$label" >"$MACLANG_HOME/print.out" 2>&1; then fail "R-10 still loaded"; fi
+grep -q 'Could not find service' "$MACLANG_HOME/print.out" || fail "R-10 print: $(head -1 "$MACLANG_HOME/print.out")"
+[[ ! -e "$MACLANG_LAUNCH_AGENTS_DIR/$label.plist" ]] || fail "R-10 plist still in place"
+wait_port_free || fail "R-10 port still bound"
+echo "R-10 ok (trash holds: $(ls "$HOME/.Trash" 2>/dev/null | grep -c "$label") item(s) matching the label)"
+
+# R-12: stop refuses to kill anything that is not this install's own server
+cat >"$MACLANG_HOME/fake.py" <<PY
+import http.server, json, os, sys
+claimed = sys.argv[1]
+class H(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        body = json.dumps({"status": "ok", "version": "0.1.0", "pid": os.getpid(), "session": "Aqua",
+                           "engine": "fake", "label": "fake", "executable": claimed}).encode()
+        self.send_response(200); self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body)
+    def log_message(self, *a): pass
+http.server.HTTPServer(("127.0.0.1", $port), H).serve_forever()
+PY
+bundle_exe="$MACLANG_HOME/MacLang.app/Contents/MacOS/maclang"
+for claimed in /usr/bin/python3 "$bundle_exe"; do
+  python3 -I "$MACLANG_HOME/fake.py" "$claimed" >/dev/null 2>&1 &
+  fake=$!; helper_pids+=("$fake")
+  wait_health 50 || fail "R-12 fake server did not start"
+  set +e; "$bin" service stop >/dev/null 2>"$MACLANG_HOME/err"; rc=$?; set -e
+  expect_eq "R-12 exit (claims $claimed)" "$rc" 1
+  kill -0 "$fake" 2>/dev/null || fail "R-12 the fake server was killed (claims $claimed)"
+  kill "$fake"; wait "$fake" 2>/dev/null || true
+  wait_port_free || fail "R-12 port"
+done
+echo "R-12 ok"
+
 cleanup
 set +e
 [[ "$(launchctl print "gui/$uid" 2>/dev/null | grep -c 'maclang.e2e')" == 0 ]] || fail "launchd still lists maclang.e2e"
