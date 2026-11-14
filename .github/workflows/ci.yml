@@ -1,0 +1,107 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+      - "feature/**"
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-test:
+    name: build + test (Xcode 27)
+    runs-on: xcode-27
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Versions
+        run: swift --version && xcodebuild -version
+
+      - name: Build (release, stripped)
+        run: swift build -c release -Xlinker -s
+
+      - name: Test
+        run: swift test
+
+      - name: Release workflow contract
+        run: ruby Tests/Integration/release-workflow-contract.rb
+
+      - name: Release binary smoke test
+        run: Tests/Integration/release-binary-launch-smoke.sh .build/release/maclang
+
+      # Both contract scripts run against the mock engine; the real Translation framework needs a
+      # GUI login session and is covered by Tests/Integration/session-e2e.sh (local only, not CI).
+      - name: CLI contract (mock engine)
+        run: Tests/Integration/cli-contract.sh .build/release/maclang
+
+      - name: HTTP server contract (mock engine)
+        run: Tests/Integration/serve-contract.sh .build/release/maclang
+
+      - name: Privacy guard
+        run: |
+          Tests/Integration/privacy-guard.sh --self-test
+          Tests/Integration/privacy-guard.sh
+
+      - name: Upload canonical release binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: maclang-xcode-27
+          path: .build/release/maclang
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Release notes generator smoke test
+        run: |
+          LATEST_TAG="$(git tag --sort=-v:refname | head -1)"
+          if [ -z "$LATEST_TAG" ]; then
+            echo "no tags yet — skipping"
+          else
+            OUT="$(scripts/gen-release-notes.sh "$LATEST_TAG")"
+            echo "$OUT"
+            echo "$OUT" | grep -qE "^## maclang ${LATEST_TAG}\$" || { echo "::error::missing title heading"; exit 1; }
+            echo "$OUT" | grep -q "What's Changed" || { echo "::error::missing What's Changed section"; exit 1; }
+          fi
+
+      - name: Release notes generator — decoy heading regression test
+        run: |
+          # The keynote matcher must reject a near-miss CHANGELOG heading (e.g. "## v0X2X0" vs
+          # tag "v0.2.0"), not treat "." as an ERE wildcard and leak the wrong section.
+          TMPD="$(mktemp -d)"
+          mkdir -p "$TMPD/scripts"
+          cp scripts/gen-release-notes.sh "$TMPD/scripts/"
+          git -C "$TMPD" init -q
+          git -C "$TMPD" config user.email t@t.com
+          git -C "$TMPD" config user.name t
+          ( cd "$TMPD" && echo x > f.txt && git add f.txt && git commit -qm "feat: initial" && git tag v0.2.0 )
+          printf '# Changelog\n\n## v0X2X0\n\nDECOY\n' > "$TMPD/CHANGELOG.md"
+          OUT="$(cd "$TMPD" && bash scripts/gen-release-notes.sh v0.2.0)"
+          rm -rf "$TMPD"
+          echo "$OUT" | grep -q "DECOY" && { echo "::error::keynote matcher leaked a non-matching CHANGELOG heading"; exit 1; }
+          echo "ok: decoy heading correctly rejected"
+
+  launch-macos-26:
+    name: launch canonical binary (macOS 26)
+    needs: build-test
+    runs-on: macos-26
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download canonical release binary
+        uses: actions/download-artifact@v4
+        with:
+          name: maclang-xcode-27
+          path: dist
+
+      - name: Smoke test on macOS 26
+        run: |
+          chmod +x dist/maclang
+          Tests/Integration/release-binary-launch-smoke.sh dist/maclang

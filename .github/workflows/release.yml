@@ -1,0 +1,100 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build canonical release candidate (Xcode 27)
+    runs-on: xcode-27
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Versions
+        run: swift --version && xcodebuild -version
+
+      - name: Test
+        run: swift test
+
+      - name: Release workflow contract
+        run: ruby Tests/Integration/release-workflow-contract.rb
+
+      - name: Build (release, stripped) + package
+        run: |
+          swift build -c release -Xlinker -s
+          BIN=.build/release/maclang
+          codesign --verify --strict "$BIN"
+          Tests/Integration/release-binary-launch-smoke.sh "$BIN"
+          EXPECTED_VERSION="maclang ${GITHUB_REF_NAME#v}"
+          ACTUAL_VERSION="$("$BIN" --version)"
+          if [ "$ACTUAL_VERSION" != "$EXPECTED_VERSION" ]; then
+            echo "::error::tag/binary version mismatch: expected '$EXPECTED_VERSION', got '$ACTUAL_VERSION'"
+            exit 1
+          fi
+          TARBALL="maclang-${GITHUB_REF_NAME}-macos-arm64.tar.gz"
+          mkdir -p dist
+          tar -C "$(dirname "$BIN")" -czf "dist/${TARBALL}" "$(basename "$BIN")"
+          ( cd dist && shasum -a 256 "${TARBALL}" > "${TARBALL}.sha256" )
+
+      - name: Generate release notes
+        run: scripts/gen-release-notes.sh "${GITHUB_REF_NAME}" > dist/RELEASE_NOTES.md
+
+      - name: Upload release candidate
+        uses: actions/upload-artifact@v4
+        with:
+          name: maclang-release-candidate
+          path: dist/
+          if-no-files-found: error
+          retention-days: 1
+
+  verify-macos-26:
+    name: verify packaged release (macOS 26)
+    needs: build
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download release candidate
+        uses: actions/download-artifact@v4
+        with:
+          name: maclang-release-candidate
+          path: dist
+
+      - name: Verify checksum, package, signature, and launch
+        run: |
+          TARBALL="maclang-${GITHUB_REF_NAME}-macos-arm64.tar.gz"
+          ( cd dist && shasum -a 256 -c "${TARBALL}.sha256" )
+          test "$(tar -tzf "dist/${TARBALL}")" = maclang
+          mkdir verify
+          tar -xzf "dist/${TARBALL}" -C verify
+          codesign --verify --strict verify/maclang
+          test "$(verify/maclang --version)" = "maclang ${GITHUB_REF_NAME#v}"
+          Tests/Integration/release-binary-launch-smoke.sh verify/maclang
+
+  publish:
+    name: publish verified release
+    needs: [build, verify-macos-26]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download verified release candidate
+        uses: actions/download-artifact@v4
+        with:
+          name: maclang-release-candidate
+          path: dist
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.tar.gz
+            dist/*.tar.gz.sha256
+          fail_on_unmatched_files: true
+          body_path: dist/RELEASE_NOTES.md
