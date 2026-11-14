@@ -46,3 +46,51 @@ public enum ErrorCode: String, Sendable, CaseIterable {
         return (400..<500).contains(httpStatus) ? .usage : .runtimeError
     }
 }
+
+extension ErrorCode {
+    /// Default next action for each code (single table). Call sites that know more pass a specific `fix`.
+    public var defaultFix: String {
+        switch self {
+        case .invalidRequest:
+            return "see `maclang <command> --help`; HTTP API: POST /translate {\"q\":\"Hello\",\"source\":\"auto\",\"target\":\"ko\"}"
+        case .unsupportedLanguage:
+            return "list installed pairs with `maclang languages --from <source>` (HTTP: GET /languages) and use one of the listed codes"
+        case .notInstalled:
+            return "install the pair in System Settings > General > Language & Region > Translation Languages, or omit --strategy (maclang then requests high fidelity)"
+        case .unableToDetect:
+            return "pass the language explicitly (`--from <code>`; HTTP: \"source\")"
+        case .payloadTooLarge:
+            return "split the text into smaller requests, or start the server with a larger `serve --max-body-kib`"
+        case .notFound:
+            return "use GET /health, POST /translate, POST /detect or GET /languages"
+        case .methodNotAllowed:
+            return "use the method listed for this path: GET /health, POST /translate, POST /detect, GET /languages"
+        case .timeout:
+            return "retry; for long texts raise `--timeout` (CLI) or `serve --engine-timeout`; check `maclang service status`"
+        case .sessionUnavailable:
+            return "log in to this Mac's desktop (a locked screen is fine), then retry; check `maclang doctor` and the server log (logs/server.log under the maclang home)"
+        case .invalidConfig:
+            return "fix or delete config.json in the maclang home (example: {\"host\":\"127.0.0.1\",\"port\":9091}) or rerun `maclang service install --port <N>`"
+        case .internalError:
+            return "retry; if it persists, check the server log (logs/server.log under the maclang home) and `maclang doctor`"
+        }
+    }
+}
+
+/// An error carrying a table code, a human-readable message (no request text), a copy-pasteable next
+/// action (`fix`, defaulting to the code's table entry) and an optional echo of the offending input.
+public struct LangError: Error, Sendable, Equatable {
+    public let code: ErrorCode
+    public let message: String
+    public let fix: String
+    public let field: String?
+    public let received: String?
+
+    public init(_ code: ErrorCode, _ message: String, fix: String? = nil, field: String? = nil, received: String? = nil) {
+        self.code = code
+        self.message = message
+        self.fix = fix ?? code.defaultFix
+        self.field = field
+        self.received = received
+    }
+}
