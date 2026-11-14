@@ -156,7 +156,7 @@ public enum Wire {
     }
 
     /// Raw form parsing (values stay strings; `QueryString.parse` would type them).
-    static func parseForm(_ text: String) -> [String: Any] {
+    public static func parseForm(_ text: String) -> [String: Any] {
         var out: [String: Any] = [:]
         for pair in text.split(separator: "&") {
             let kv = pair.split(separator: "=", maxSplits: 1, omittingEmptySubsequences: false)

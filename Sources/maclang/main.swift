@@ -36,6 +36,7 @@ func dispatch(_ args: [String]) async -> Int32 {
         case "detect":    return try await DetectCommand.run(rest)
         case "languages": return try await LanguagesCommand.run(rest)
         case "doctor":    return try await DoctorCommand.run(rest)
+        case "serve":     return try await ServeCommand.run(rest)
         case "help", "-h", "--help": printUsage(); return ExitCode.success.rawValue
         case "version", "--version": IO.emitText("maclang \(Version.current)\n"); return ExitCode.success.rawValue
         default:

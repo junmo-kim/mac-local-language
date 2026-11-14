@@ -231,3 +231,46 @@ enum DoctorCommand {
         return 0
     }
 }
+
+// MARK: - serve
+
+enum ServeCommand {
+    static let help = """
+    maclang serve [--host H] [--port N] [--max-body-kib K] [--engine-timeout SEC]
+
+    Run the LibreTranslate-compatible HTTP server (POST /translate, POST /detect, GET /languages,
+    GET /health). Host and port default to <home>/config.json (127.0.0.1:9091). --max-body-kib
+    defaults to 1024 and --engine-timeout to 30. The real engine needs a GUI login session; the
+    command refuses to start (exit 75) without one.
+    """
+
+    static func run(_ rest: [String]) async throws -> Int32 {
+        let args = ArgParser.parse(rest, booleanFlags: ["help"])
+        if wantsHelp(args) { IO.emitText(help + "\n"); return 0 }
+        let hostFlag = try optString(args, "host")
+        let portFlag = try optInt(args, "port")
+        let maxBodyKiB = try optInt(args, "max-body-kib") ?? 1024
+        let engineTimeout = try optDouble(args, "engine-timeout") ?? 30
+        if let p = portFlag, !(1...65535).contains(p) { throw CLIError("invalid --port: \(p) (expected 1-65535)") }
+        guard maxBodyKiB > 0 else { throw CLIError("invalid --max-body-kib: \(maxBodyKiB) (expected a positive integer)") }
+
+        let engineKind = EngineKind(env: environment)
+        let session = Launcher.sessionKind()
+        if engineKind == .apple, session != .gui {
+            throw CLIError("the apple engine needs a GUI login session (current session: \(session.name)); nothing was bound",
+                           code: .sessionUnavailable)
+        }
+
+        let paths = Paths(env: environment, userHome: FileManager.default.homeDirectoryForCurrentUser)
+        let config: Config
+        do { config = try Config.parse(try? Data(contentsOf: paths.config)) } catch { throw CLIError(error) }
+
+        let settings = ServerSettings(
+            host: hostFlag ?? config.host, port: portFlag ?? config.port,
+            maxBodyBytes: maxBodyKiB * 1024, engineTimeout: engineTimeout,
+            engineName: engineKind == .mock ? "mock" : "apple-translation",
+            session: session.name, label: paths.label)
+        let engine = EngineFactory.make(env: environment, timeoutSeconds: engineTimeout)
+        return await HTTPServer.run(settings: settings, engine: engine)
+    }
+}
