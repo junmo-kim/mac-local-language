@@ -11,15 +11,17 @@ public struct MockEngine: TranslationEngine {
 
     public func translate(_ text: String, from: String?, to: String, strategy: StrategyOption?) async throws(EngineError) -> TranslationOutput {
         try await pause()
-        guard to != "xx" else { throw EngineError(.unsupportedLanguage, "unsupported target language: \(to)") }
-        return TranslationOutput(text: "[mock \(from ?? "auto")→\(to)] \(text)")
+        guard to != "xx" else { throw EngineError(.unsupportedLanguage, "unsupported target language: \(to)", field: "target", received: to) }
+        if let from { return TranslationOutput(text: "[mock \(from)→\(to)] \(text)") }
+        let detected = NLDetector.detectOrFallback(text)
+        return TranslationOutput(text: "[mock \(detected.language)→\(to)] \(text)", detected: detected)
     }
 
     public func languages(strategy: StrategyOption?, from: String?) async throws(EngineError) -> [LanguageEntry] {
         try await pause()
         let codes: [String]
         if let from {
-            guard Self.pairs[from] != nil else { throw EngineError(.unsupportedLanguage, "unsupported source language: \(from)") }
+            guard Self.pairs[from] != nil else { throw EngineError(.unsupportedLanguage, "unsupported source language: \(from)", field: "source", received: from) }
             codes = [from]
         } else {
             codes = Self.pairs.keys.sorted()

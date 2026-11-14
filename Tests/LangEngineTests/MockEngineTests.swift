@@ -12,6 +12,19 @@ struct MockEngineTests {
         #expect(out.detected == nil)
     }
 
+    // With from=auto the mock labels the output with the NaturalLanguage-detected code and reports it.
+    // When nothing can be detected it behaves like the real engine (LibreTranslate parity): source
+    // `en`, reported as detected with confidence 0.
+    @Test("E-MOCK-1 auto source uses the detected code, or en with confidence 0 when none")
+    func autoSource() async throws {
+        let out = try await MockEngine().translate("Bonjour tout le monde", from: nil, to: "ko", strategy: nil)
+        #expect(out.text == "[mock fr→ko] Bonjour tout le monde")
+        #expect(out.detected?.language == "fr")
+        let none = try await MockEngine().translate("12345", from: nil, to: "ko", strategy: nil)
+        #expect(none.text == "[mock en→ko] 12345")
+        #expect(none.detected == Detection(language: "en", probability: 0))
+    }
+
     @Test("E-MOCK-1 target xx is unsupported_language")
     func unsupported() async {
         do {
